@@ -1,5 +1,9 @@
 # AGENTS.md
 
+## 概要
+
+このリポジトリは、Go2 を中心とした embodied AI / assistive robotics / navigation に関する個人研究を管理するための研究用リポジトリである。
+
 ## 範囲
 
 このリポジトリは、複数プロジェクトにまたがる Go2 ガイドロボット研究を管理する。
