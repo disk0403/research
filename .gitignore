@@ -1,0 +1,37 @@
+# Local Python environments
+.venv/
+**/.venv/
+projects/go2-mujoco/.venv/
+
+# External runtime assets
+projects/go2-mujoco/external/
+
+# Local paper PDFs
+papers/pdfs/*
+!papers/pdfs/.gitkeep
+
+# Python caches and test/tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Logs and local environment files
+*.log
+.env
+.env.*
+
+# macOS metadata
+.DS_Store
+._*
+__MACOSX/
+.AppleDouble/
+
+# Local agent/tooling mounts
+.agents/
+.codex/
+**/.agents/
+**/.codex/

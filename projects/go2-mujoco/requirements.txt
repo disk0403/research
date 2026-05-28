@@ -1,0 +1,5 @@
+mujoco==3.8.1
+numpy==2.2.6
+onnxruntime==1.23.2
+PyYAML==6.0.3
+glfw==2.10.0
