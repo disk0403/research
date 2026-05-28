@@ -4,6 +4,8 @@ Unitree Go2 を MuJoCo 上で動かすための実験用プロジェクトです
 
 現在の実行スクリプトは `scripts/go2_teleop.py` の 1 本です。学習済み ONNX ポリシーを使い、平面シーン上の Go2 を WASD/QE キーで操作できます。Shift ダッシュと Space ジャンプ補助も入っています。
 
+追加の実験スクリプトとして `scripts/go2_vision_target_follow.py` があります。MuJoCo 内で Go2 の前方カメラ画像を描画し、マゼンタ色の球を簡単な色しきい値で検出して、対象物へ低速追従します。
+
 ## クイックスタート
 
 依存パッケージを入れます。
@@ -36,6 +38,32 @@ GUI なしで短時間テストする場合:
 python3 scripts/go2_teleop.py --headless --duration 2 --test-command-vx 0.4
 ```
 
+カメラ画像から対象物を検出して追従するプロトタイプ:
+
+```bash
+python3 scripts/go2_vision_target_follow.py --duration 8
+```
+
+このスクリプトは GUI ウィンドウを開き、MuJoCo 内の Go2 とターゲットを表示します。実機カメラではなく、MuJoCo の仮想前方カメラ画像を対象物検出に使います。外部モデル資産は編集せず、実行時に一時 XML を作ってカメラとマゼンタ色の球ターゲットを追加します。
+
+GUI なしで実行する場合:
+
+```bash
+python3 scripts/go2_vision_target_follow.py --headless --duration 8
+```
+
+GUI を閉じるまで動かす場合:
+
+```bash
+python3 scripts/go2_vision_target_follow.py --duration 0
+```
+
+カメラ画像を確認したい場合は PPM 画像を書き出せます。
+
+```bash
+python3 scripts/go2_vision_target_follow.py --headless --duration 2 --debug-frames-dir logs/vision_frames
+```
+
 ## 操作
 
 ```text
@@ -62,6 +90,7 @@ Esc          終了
 ```text
 requirements.txt
 scripts/go2_teleop.py
+scripts/go2_vision_target_follow.py
 external/unitree_mujoco/unitree_robots/go2/
 external/policies/unitree-go2-velocity-flat/
 .venv/
@@ -83,6 +112,29 @@ external/policies/unitree-go2-velocity-flat/
 ```text
 external/unitree_mujoco/unitree_robots/go2/scene_flat.xml
 ```
+
+### `scripts/go2_vision_target_follow.py`
+
+仮想カメラ画像から単純な対象物を検出して追従する実験スクリプトです。
+
+- 実行時に一時ディレクトリへ Go2 XML を生成する
+- `base_link` に前向き固定カメラを追加する
+- 平面上にマゼンタ色の球ターゲットを置く
+- MuJoCo のオフスクリーンレンダリング画像からターゲットを色しきい値で検出する
+- GUI では三人称視点で Go2 とターゲットを表示する
+- 画像上の左右ずれから旋回指令、見かけ面積から前進指令を出す
+- 対象物へ近づいた、転倒姿勢になった、制限時間に達した、などの理由で停止する
+
+実行例:
+
+```bash
+python3 scripts/go2_vision_target_follow.py --duration 8
+python3 scripts/go2_vision_target_follow.py --target-x 2.5 --target-y -0.4 --duration 10
+python3 scripts/go2_vision_target_follow.py --headless --duration 8
+python3 scripts/go2_vision_target_follow.py --headless --duration 2 --debug-frames-dir logs/vision_frames
+```
+
+ヘッドレス実行では `MUJOCO_GL=egl` が必要になる場合があります。このスクリプトは `--headless` 指定時に、未設定なら `MUJOCO_GL=egl` を既定値として使います。GUI 実行時は `--display` で表示先を指定できます。
 
 ### `external/unitree_mujoco/unitree_robots/go2/`
 
@@ -145,6 +197,7 @@ python3 scripts/go2_teleop.py --help
 README.md
 requirements.txt
 scripts/go2_teleop.py
+scripts/go2_vision_target_follow.py
 external/unitree_mujoco/LICENSE
 external/unitree_mujoco/readme.md
 external/unitree_mujoco/unitree_robots/go2/

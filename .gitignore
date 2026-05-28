@@ -21,6 +21,7 @@ __pycache__/
 
 # Logs and local environment files
 *.log
+projects/go2-mujoco/logs/
 .env
 .env.*
 
