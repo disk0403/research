@@ -36,3 +36,6 @@ __MACOSX/
 .codex/
 **/.agents/
 **/.codex/
+
+# Local-only files
+local/
