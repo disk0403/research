@@ -21,6 +21,7 @@ Go2 が低速で 2D ウェイポイントを追従し、転倒・接触・危険
 - WASD/QE/Shift/Space で平面移動、旋回、ダッシュ、ジャンプ補助を試せる。
 - `--headless --duration` で短時間のスモークテストを実行できる。
 - `projects/go2-mujoco/scripts/go2_vision_target_follow.py` で、MuJoCo の仮想前方カメラ画像から単純な色付き対象物を検出し、低速で追従するプロトタイプを試せる。
+- `projects/go2-mujoco/scripts/go2_continuous_rough_terrain_teleop.py` で、隙間や段差のない連続的な凹凸路面上の手動操作を試せる。
 
 まだできていないこと:
 

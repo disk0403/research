@@ -17,9 +17,23 @@ FLAT_ONLY_SCENE = MODEL_DIR / "scene_flat.xml"
 POLICY_DIR = ROOT / "external" / "policies" / "unitree-go2-velocity-flat"
 DEFAULT_DISPLAY = ":1"
 DEFAULT_RENDER_FPS = 60.0
+DEFAULT_RESET_BASE_HEIGHT = 0.25
+DEFAULT_STANCE_CROUCH = 0.08
+DEFAULT_MIN_STANCE_CROUCH = 0.0
+DEFAULT_MAX_STANCE_CROUCH = 0.20
+DEFAULT_STANCE_ADJUST_STEP = 0.02
+DEFAULT_FALL_HEIGHT = 0.16
+DEFAULT_FALL_UPRIGHTNESS = 0.55
+DEFAULT_FALL_WARMUP = 0.5
+DEFAULT_IDLE_DAMPING_SCALE = 1.8
+DEFAULT_IDLE_BASE_DAMPING = 2.0
+DEFAULT_IDLE_SPEED_DEADBAND = 0.12
 
 OFFICIAL_ABDUCTION_LIMIT = math.radians(48.0)
 WORLD_GRAVITY = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+LEG_NAMES = ("FR", "FL", "RR", "RL")
+FRONT_LEGS = frozenset(("FR", "FL"))
+REAR_LEGS = frozenset(("RR", "RL"))
 
 
 @dataclass(frozen=True)
@@ -34,9 +48,12 @@ class ActuatorBinding:
 @dataclass
 class CommandState:
     command: np.ndarray
+    jump_requested: bool
     jump_held: bool
     dash_held: bool
     active_motion: bool
+    reset_requested: bool = False
+    stance_adjust: int = 0
 
 
 def vector_from_config(
@@ -122,6 +139,7 @@ class Go2PolicyController:
         )
         self._target_joint_pos = self._default_joint_pos.copy()
         self._last_action = np.zeros(12, dtype=np.float32)
+        self._stance_crouch = 0.0
 
         self._session = ort.InferenceSession(
             str(model_path),
@@ -143,16 +161,25 @@ class Go2PolicyController:
             ctrl_max=float(self._model.actuator_ctrlrange[actuator_id, 1]),
         )
 
-    def initialize_pose(self, data: mujoco.MjData) -> None:
+    def initialize_pose(
+        self,
+        data: mujoco.MjData,
+        base_height: float = 0.27,
+        stance_crouch: float | None = None,
+    ) -> None:
         mujoco.mj_resetData(self._model, data)
-        data.qpos[0:3] = np.array([0.0, 0.0, 0.27], dtype=np.float64)
+        if stance_crouch is not None:
+            self.set_stance_crouch(stance_crouch)
+
+        data.qpos[0:3] = np.array([0.0, 0.0, base_height], dtype=np.float64)
         data.qpos[3:7] = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64)
         data.qvel[:] = 0.0
 
-        for i, binding in enumerate(self._bindings):
-            data.qpos[binding.qpos_adr] = self._default_joint_pos[i]
-
         self._target_joint_pos[:] = self._default_joint_pos
+        initial_joint_pos = self.target_joint_positions()
+        for i, binding in enumerate(self._bindings):
+            data.qpos[binding.qpos_adr] = initial_joint_pos[i]
+
         self._last_action[:] = 0.0
         mujoco.mj_forward(self._model, data)
 
@@ -169,12 +196,33 @@ class Go2PolicyController:
         self._last_action[:] = action
         self._target_joint_pos[:] = self._action_offset + self._action_scale * action
 
-    def apply_pd(self, data: mujoco.MjData) -> None:
+    def clamp_target_positions(self, target: np.ndarray) -> np.ndarray:
+        return target
+
+    def set_stance_crouch(self, stance_crouch: float) -> None:
+        self._stance_crouch = max(0.0, float(stance_crouch))
+
+    @property
+    def stance_crouch(self) -> float:
+        return self._stance_crouch
+
+    def stance_offset(self) -> np.ndarray:
+        offset = np.zeros(12, dtype=np.float64)
+        for base in range(0, 12, 3):
+            offset[base + 1] = self._stance_crouch
+            offset[base + 2] = -2.0 * self._stance_crouch
+        return offset
+
+    def target_joint_positions(self) -> np.ndarray:
+        return self.clamp_target_positions(self._target_joint_pos + self.stance_offset())
+
+    def apply_pd(self, data: mujoco.MjData, damping_scale: float = 1.0) -> None:
+        target_joint_pos = self.target_joint_positions()
         for i, binding in enumerate(self._bindings):
             q = data.qpos[binding.qpos_adr]
             dq = data.qvel[binding.dof_adr]
-            tau = self._stiffness[i] * (self._target_joint_pos[i] - q)
-            tau -= self._damping[i] * dq
+            tau = self._stiffness[i] * (target_joint_pos[i] - q)
+            tau -= damping_scale * self._damping[i] * dq
             data.ctrl[binding.actuator_id] = np.clip(
                 tau,
                 binding.ctrl_min,
@@ -224,6 +272,10 @@ class MouseKeyboardViewer:
         self._model = model
         self._window = None
         self._last_cursor: tuple[float, float] | None = None
+        self._space_was_down = False
+        self._reset_was_down = False
+        self._lower_was_down = False
+        self._raise_was_down = False
 
         if not glfw.init():
             raise RuntimeError("Failed to initialize GLFW.")
@@ -399,15 +451,95 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--reset-base-height",
+        type=float,
+        default=DEFAULT_RESET_BASE_HEIGHT,
+        help="Base/root z height used when initializing or resetting the robot.",
+    )
+    parser.add_argument(
+        "--stance-crouch",
+        type=float,
+        default=DEFAULT_STANCE_CROUCH,
+        help=(
+            "Low-stance joint bias in radians. Positive values crouch the legs "
+            "by increasing thigh targets and decreasing calf targets."
+        ),
+    )
+    parser.add_argument(
+        "--min-stance-crouch",
+        type=float,
+        default=DEFAULT_MIN_STANCE_CROUCH,
+        help="Lower bound for runtime Z/X stance adjustment.",
+    )
+    parser.add_argument(
+        "--max-stance-crouch",
+        type=float,
+        default=DEFAULT_MAX_STANCE_CROUCH,
+        help="Upper bound for runtime Z/X stance adjustment.",
+    )
+    parser.add_argument(
+        "--stance-adjust-step",
+        type=float,
+        default=DEFAULT_STANCE_ADJUST_STEP,
+        help="Runtime stance crouch change per Z/X key press.",
+    )
+    parser.add_argument(
+        "--fall-height",
+        type=float,
+        default=DEFAULT_FALL_HEIGHT,
+        help="Auto-reset when base/root z drops below this height.",
+    )
+    parser.add_argument(
+        "--fall-uprightness",
+        type=float,
+        default=DEFAULT_FALL_UPRIGHTNESS,
+        help="Auto-reset when root z-axis uprightness drops below this value.",
+    )
+    parser.add_argument(
+        "--fall-warmup",
+        type=float,
+        default=DEFAULT_FALL_WARMUP,
+        help="Seconds after each reset before fall auto-reset checks start.",
+    )
+    parser.add_argument(
+        "--no-auto-reset-on-fall",
+        action="store_true",
+        help="Disable automatic reset on fall. Manual R reset still works.",
+    )
+    parser.add_argument(
+        "--idle-damping-scale",
+        type=float,
+        default=DEFAULT_IDLE_DAMPING_SCALE,
+        help=(
+            "Joint damping multiplier used only while command input is zero "
+            "and the jump assist is inactive."
+        ),
+    )
+    parser.add_argument(
+        "--idle-base-damping",
+        type=float,
+        default=DEFAULT_IDLE_BASE_DAMPING,
+        help=(
+            "Light root velocity damping while stopped and feet are in contact. "
+            "Use 0 to disable."
+        ),
+    )
+    parser.add_argument(
+        "--idle-speed-deadband",
+        type=float,
+        default=DEFAULT_IDLE_SPEED_DEADBAND,
+        help="Maximum planar speed where idle root damping is allowed.",
+    )
+    parser.add_argument(
         "--jump-duration",
         type=float,
-        default=0.72,
-        help="Maximum seconds for one held space-key jump assist.",
+        default=0.78,
+        help="Seconds for one tap-triggered jump assist.",
     )
     parser.add_argument(
         "--jump-blend",
         type=float,
-        default=0.88,
+        default=0.95,
         help="Maximum blend from policy targets to the joint-space jump posture.",
     )
     parser.add_argument(
@@ -432,13 +564,13 @@ def parse_args() -> argparse.Namespace:
         "--test-jump-time",
         type=float,
         default=-1.0,
-        help="Headless/debug option: hold the jump key from this sim time.",
+        help="Headless/debug option: trigger one jump tap at this sim time.",
     )
     parser.add_argument(
         "--test-jump-hold",
         type=float,
         default=0.35,
-        help="Headless/debug seconds to hold the jump key.",
+        help="Deprecated compatibility option. Jump is now tap-triggered.",
     )
     return parser.parse_args()
 
@@ -451,11 +583,8 @@ class SimToRealPolicyController(Go2PolicyController):
     def clamp_target_positions(self, target: np.ndarray) -> np.ndarray:
         return np.clip(target, self._target_min, self._target_max)
 
-    def apply_pd(self, data: mujoco.MjData) -> None:
-        self._target_joint_pos[:] = self.clamp_target_positions(
-            self._target_joint_pos
-        )
-        super().apply_pd(data)
+    def apply_pd(self, data: mujoco.MjData, damping_scale: float = 1.0) -> None:
+        super().apply_pd(data, damping_scale=damping_scale)
 
     def _build_target_limits(self) -> tuple[np.ndarray, np.ndarray]:
         lower = []
@@ -501,46 +630,108 @@ class JointSpaceJumpController:
         self._policy = policy
         self._bindings = policy._bindings
         self._default = policy._default_joint_pos.astype(np.float64)
+        self._leg_bases = self._resolve_leg_bases()
+        self._foot_geom_ids = self._resolve_named_ids(mujoco.mjtObj.mjOBJ_GEOM)
+        self._foot_body_ids = self._resolve_named_ids(
+            mujoco.mjtObj.mjOBJ_BODY,
+            suffix="_foot",
+        )
         self._jump_duration = jump_duration
         self._jump_blend = max(0.0, min(jump_blend, 1.0))
         self._active = False
-        self._release_required = False
+        self._recovering = False
         self._start_time = 0.0
         self._start_targets = self._default.copy()
+        self._active_duration = jump_duration
+        self._active_blend = self._jump_blend
+        self._motion_factor = 0.0
+        self._last_motion_time: float | None = None
+        self._last_planar_velocity = np.zeros(2, dtype=np.float64)
+        self._last_jump_target = self._default.copy()
+        self._recovery_start_time = 0.0
+        self._recovery_duration = 0.24
+        self._recovery_start_targets = self._default.copy()
 
-        min_stiffness = np.tile([26.0, 42.0, 68.0], 4)
-        min_damping = np.tile([1.8, 2.8, 4.0], 4)
-        self._stiffness = np.maximum(
-            policy._stiffness.astype(np.float64) * 2.1,
+        min_stiffness = np.tile([32.0, 56.0, 90.0], 4)
+        min_damping = np.tile([2.6, 4.4, 6.4], 4)
+        self._base_stiffness = np.maximum(
+            policy._stiffness.astype(np.float64) * 2.2,
             min_stiffness,
         )
-        self._damping = np.maximum(
-            policy._damping.astype(np.float64) * 2.0,
+        self._base_damping = np.maximum(
+            policy._damping.astype(np.float64) * 2.6,
             min_damping,
         )
+        self._stiffness = self._base_stiffness.copy()
+        self._damping = self._base_damping.copy()
 
-        self._compress = self._default.copy()
-        self._extend = self._default.copy()
-        self._air = self._default.copy()
-        self._landing = self._default.copy()
-        for base in range(0, 12, 3):
-            self._compress[base + 1] = 1.03
-            self._compress[base + 2] = -2.04
-            self._extend[base + 1] = 0.52
-            self._extend[base + 2] = -1.04
-            self._air[base + 1] = 0.76
-            self._air[base + 2] = -1.44
-            self._landing[base + 1] = 0.94
-            self._landing[base + 2] = -1.92
-
-        self._compress = policy.clamp_target_positions(self._compress)
-        self._extend = policy.clamp_target_positions(self._extend)
-        self._air = policy.clamp_target_positions(self._air)
-        self._landing = policy.clamp_target_positions(self._landing)
+        self._static_compress = self._posture(thigh=1.12, calf=-2.22)
+        self._static_extend = self._posture(thigh=0.42, calf=-0.94)
+        self._static_air = self._posture(thigh=0.64, calf=-1.28)
+        self._static_landing = self._posture(thigh=1.00, calf=-2.00)
+        (
+            self._moving_compress,
+            self._moving_extend,
+            self._moving_air,
+            self._moving_landing,
+        ) = self._build_moving_targets(True, {leg: 1.0 for leg in LEG_NAMES})
+        self._compress = self._static_compress.copy()
+        self._extend = self._static_extend.copy()
+        self._air = self._static_air.copy()
+        self._landing = self._static_landing.copy()
 
     @property
     def active(self) -> bool:
-        return self._active
+        return self._active or self._recovering
+
+    def cancel(self) -> None:
+        self._active = False
+        self._recovering = False
+        self._last_motion_time = None
+        self._last_planar_velocity[:] = 0.0
+
+    def foot_contact_count(self, data: mujoco.MjData) -> int:
+        return sum(score >= 0.5 for score in self._foot_contact_scores(data).values())
+
+    def apply_if_requested(
+        self,
+        data: mujoco.MjData,
+        jump_requested: bool,
+        policy_target: np.ndarray,
+    ) -> bool:
+        planar_speed, planar_accel = self._update_motion_estimate(data)
+
+        if jump_requested and not self.active:
+            self._active = True
+            self._recovering = False
+            self._start_time = data.time
+            self._start_targets = np.array(
+                [data.qpos[b.qpos_adr] for b in self._bindings],
+                dtype=np.float64,
+            )
+            self._configure_profile(data, planar_speed, planar_accel)
+
+        if not self._active:
+            return self._apply_recovery(data, policy_target)
+
+        elapsed = data.time - self._start_time
+        if elapsed >= self._active_duration:
+            self._begin_recovery(data)
+            return self._apply_recovery(data, policy_target)
+
+        jump_target, blend, stiffness_scale, damping_scale = self._target_for_time(
+            data,
+            elapsed
+        )
+        target = (1.0 - blend) * policy_target + blend * jump_target
+        self._last_jump_target = target.copy()
+        self._apply_joint_targets(
+            data,
+            self._policy.clamp_target_positions(target),
+            stiffness_scale,
+            damping_scale,
+        )
+        return True
 
     def apply_if_held(
         self,
@@ -548,60 +739,310 @@ class JointSpaceJumpController:
         jump_held: bool,
         policy_target: np.ndarray,
     ) -> bool:
-        if not jump_held:
-            self._active = False
-            self._release_required = False
-            return False
+        return self.apply_if_requested(data, jump_held, policy_target)
 
-        if self._release_required:
-            return False
+    def _resolve_leg_bases(self) -> dict[str, int]:
+        bases: dict[str, int] = {}
+        for index, binding in enumerate(self._bindings):
+            actuator_name = mujoco.mj_id2name(
+                self._policy._model,
+                mujoco.mjtObj.mjOBJ_ACTUATOR,
+                binding.actuator_id,
+            )
+            if actuator_name is None:
+                continue
+            for leg in LEG_NAMES:
+                if actuator_name == f"{leg}_hip":
+                    bases[leg] = index
 
-        if not self._active:
-            self._active = True
-            self._start_time = data.time
-            self._start_targets = np.array(
-                [data.qpos[b.qpos_adr] for b in self._bindings],
-                dtype=np.float64,
+        if set(bases) == set(LEG_NAMES):
+            return bases
+
+        return {"FR": 0, "FL": 3, "RR": 6, "RL": 9}
+
+    def _resolve_named_ids(
+        self,
+        obj_type: mujoco.mjtObj,
+        suffix: str = "",
+    ) -> dict[str, int]:
+        ids: dict[str, int] = {}
+        for leg in LEG_NAMES:
+            name = f"{leg}{suffix}"
+            obj_id = mujoco.mj_name2id(self._policy._model, obj_type, name)
+            if obj_id >= 0:
+                ids[leg] = int(obj_id)
+        return ids
+
+    def _posture(self, thigh: float, calf: float) -> np.ndarray:
+        target = self._default.copy()
+        for leg in LEG_NAMES:
+            self._set_leg_posture(target, leg, thigh, calf)
+        return self._policy.clamp_target_positions(target)
+
+    def _set_leg_posture(
+        self,
+        target: np.ndarray,
+        leg: str,
+        thigh: float,
+        calf: float,
+    ) -> None:
+        base = self._leg_bases[leg]
+        target[base + 1] = thigh
+        target[base + 2] = calf
+
+    def _per_leg_posture(self, postures: dict[str, tuple[float, float]]) -> np.ndarray:
+        target = self._default.copy()
+        for leg, (thigh, calf) in postures.items():
+            self._set_leg_posture(target, leg, thigh, calf)
+        return self._policy.clamp_target_positions(target)
+
+    def _configure_profile(
+        self,
+        data: mujoco.MjData,
+        planar_speed: float,
+        planar_accel: float,
+    ) -> None:
+        speed_factor = min(planar_speed / 1.1, 1.0)
+        accel_factor = min(planar_accel / 3.0, 1.0)
+        self._motion_factor = min(0.75 * speed_factor + 0.25 * accel_factor, 1.0)
+        moving_forward = float(data.qvel[0]) >= -0.05
+        contact_scores = self._foot_contact_scores(data)
+        (
+            self._moving_compress,
+            self._moving_extend,
+            self._moving_air,
+            self._moving_landing,
+        ) = self._build_moving_targets(moving_forward, contact_scores)
+
+        alpha = self._motion_factor
+        self._compress = self._blend_posture(
+            self._static_compress,
+            self._moving_compress,
+            alpha,
+        )
+        self._extend = self._blend_posture(
+            self._static_extend,
+            self._moving_extend,
+            alpha,
+        )
+        self._air = self._blend_posture(self._static_air, self._moving_air, alpha)
+        self._landing = self._blend_posture(
+            self._static_landing,
+            self._moving_landing,
+            alpha,
+        )
+        self._active_duration = self._jump_duration * (1.0 + 0.08 * alpha)
+        self._active_blend = min(self._jump_blend, 0.93) * (1.0 - 0.10 * alpha)
+
+    def _build_moving_targets(
+        self,
+        moving_forward: bool,
+        contact_scores: dict[str, float],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        push_legs = REAR_LEGS if moving_forward else FRONT_LEGS
+        landing_legs = FRONT_LEGS if moving_forward else REAR_LEGS
+
+        compress: dict[str, tuple[float, float]] = {}
+        extend: dict[str, tuple[float, float]] = {}
+        air: dict[str, tuple[float, float]] = {}
+        landing: dict[str, tuple[float, float]] = {}
+
+        for leg in LEG_NAMES:
+            contact = contact_scores.get(leg, 0.0)
+            support = 0.45 + 0.55 * contact
+            if leg in push_legs:
+                compress[leg] = (
+                    0.88 + 0.23 * support,
+                    -1.72 - 0.47 * support,
+                )
+                extend[leg] = (
+                    0.76 - 0.34 * support,
+                    -1.48 + 0.55 * support,
+                )
+                air[leg] = (0.86, -1.66)
+                landing[leg] = (0.92, -1.82)
+            else:
+                compress[leg] = (0.82, -1.58)
+                extend[leg] = (0.78, -1.48)
+                air[leg] = (0.62, -1.24) if leg in landing_legs else (0.82, -1.60)
+                landing[leg] = (
+                    (1.02, -2.02) if leg in landing_legs else (0.90, -1.78)
+                )
+
+        return (
+            self._per_leg_posture(compress),
+            self._per_leg_posture(extend),
+            self._per_leg_posture(air),
+            self._per_leg_posture(landing),
+        )
+
+    def _blend_posture(
+        self,
+        static_target: np.ndarray,
+        moving_target: np.ndarray,
+        alpha: float,
+    ) -> np.ndarray:
+        target = (1.0 - alpha) * static_target + alpha * moving_target
+        return self._policy.clamp_target_positions(target)
+
+    def _update_motion_estimate(self, data: mujoco.MjData) -> tuple[float, float]:
+        planar_velocity = np.asarray(data.qvel[0:2], dtype=np.float64)
+        speed = float(np.linalg.norm(planar_velocity))
+        if self._last_motion_time is None:
+            accel = 0.0
+        else:
+            dt = max(float(data.time - self._last_motion_time), 1e-6)
+            accel = float(
+                np.linalg.norm(planar_velocity - self._last_planar_velocity) / dt
             )
 
-        elapsed = data.time - self._start_time
-        if elapsed >= self._jump_duration:
-            self._active = False
-            self._release_required = True
+        self._last_motion_time = float(data.time)
+        self._last_planar_velocity[:] = planar_velocity
+        return speed, accel
+
+    def _foot_contact_scores(self, data: mujoco.MjData) -> dict[str, float]:
+        scores = {leg: 0.0 for leg in LEG_NAMES}
+        for contact_index in range(data.ncon):
+            contact = data.contact[contact_index]
+            for leg, geom_id in self._foot_geom_ids.items():
+                if contact.geom1 == geom_id or contact.geom2 == geom_id:
+                    if contact.dist < 0.025:
+                        scores[leg] = 1.0
+
+        missing_contact = all(score == 0.0 for score in scores.values())
+        if missing_contact and self._foot_body_ids:
+            heights = {
+                leg: float(data.xpos[body_id, 2])
+                for leg, body_id in self._foot_body_ids.items()
+            }
+            if heights:
+                lowest = min(heights.values())
+                for leg, height in heights.items():
+                    if height <= lowest + 0.035:
+                        scores[leg] = max(scores[leg], 0.65)
+
+        return scores
+
+    def _target_for_time(
+        self,
+        data: mujoco.MjData,
+        elapsed: float,
+    ) -> tuple[np.ndarray, float, float, float]:
+        compress_end = 0.16 * self._active_duration
+        push_end = 0.34 * self._active_duration
+        air_end = 0.68 * self._active_duration
+
+        if elapsed < compress_end:
+            phase = smootherstep(elapsed / max(compress_end, 1e-6))
+            target = (1.0 - phase) * self._start_targets + phase * self._compress
+            blend = self._active_blend * 0.72 * phase
+            target = self._apply_pitch_stabilization(data, target, 0.35 * phase)
+            return target, blend, 0.98, 1.25
+
+        if elapsed < push_end:
+            phase = smootherstep(
+                (elapsed - compress_end) / max(push_end - compress_end, 1e-6)
+            )
+            target = (1.0 - phase) * self._compress + phase * self._extend
+            blend = self._active_blend * (0.72 + 0.28 * phase)
+            target = self._apply_pitch_stabilization(data, target, 0.85)
+            return target, blend, 1.08 - 0.08 * self._motion_factor, 1.02
+
+        if elapsed < air_end:
+            phase = smootherstep(
+                (elapsed - push_end) / max(air_end - push_end, 1e-6)
+            )
+            target = (1.0 - phase) * self._extend + phase * self._air
+            target = self._apply_pitch_stabilization(data, target, 1.0)
+            return target, self._active_blend, 0.86, 1.20
+
+        phase = smootherstep(
+            (elapsed - air_end) / max(self._active_duration - air_end, 1e-6)
+        )
+        target = (1.0 - phase) * self._air + phase * self._landing
+        blend = self._active_blend * (
+            1.0 - (0.56 - 0.10 * self._motion_factor) * phase
+        )
+        target = self._apply_pitch_stabilization(data, target, 0.70 * (1.0 - phase))
+        return target, blend, 0.82, 1.55 + 0.15 * self._motion_factor
+
+    def _apply_pitch_stabilization(
+        self,
+        data: mujoco.MjData,
+        target: np.ndarray,
+        strength: float,
+    ) -> np.ndarray:
+        if strength <= 0.0:
+            return target
+
+        pitch_degrees, pitch_rate_degrees = self._base_pitch_and_rate(data)
+        correction = -0.0045 * pitch_degrees - 0.0012 * pitch_rate_degrees
+        correction = clamp_value(correction * strength, -0.10, 0.10)
+        if abs(correction) < 1e-5:
+            return target
+
+        stabilized = target.copy()
+        for leg in FRONT_LEGS:
+            base = self._leg_bases[leg]
+            stabilized[base + 1] -= correction
+            stabilized[base + 2] += 1.55 * correction
+        for leg in REAR_LEGS:
+            base = self._leg_bases[leg]
+            stabilized[base + 1] += 0.75 * correction
+            stabilized[base + 2] -= 1.20 * correction
+        return self._policy.clamp_target_positions(stabilized)
+
+    def _base_pitch_and_rate(self, data: mujoco.MjData) -> tuple[float, float]:
+        rotation = root_rotation_matrix(data)
+        pitch = math.atan2(
+            -rotation[2, 0],
+            math.sqrt(rotation[0, 0] ** 2 + rotation[1, 0] ** 2),
+        )
+        body_ang_vel = rotation.T @ data.qvel[3:6]
+        return math.degrees(pitch), math.degrees(float(body_ang_vel[1]))
+
+    def _begin_recovery(self, data: mujoco.MjData) -> None:
+        self._active = False
+        self._recovering = True
+        self._recovery_start_time = float(data.time)
+        self._recovery_start_targets = self._last_jump_target.copy()
+
+    def _apply_recovery(
+        self,
+        data: mujoco.MjData,
+        policy_target: np.ndarray,
+    ) -> bool:
+        if not self._recovering:
             return False
 
-        jump_target, blend = self._target_for_time(elapsed)
-        target = (1.0 - blend) * policy_target + blend * jump_target
-        self._apply_joint_targets(data, self._policy.clamp_target_positions(target))
+        elapsed = float(data.time - self._recovery_start_time)
+        if elapsed >= self._recovery_duration:
+            self._recovering = False
+            return False
+
+        phase = smootherstep(elapsed / max(self._recovery_duration, 1e-6))
+        target = (1.0 - phase) * self._recovery_start_targets + phase * policy_target
+        target = self._apply_pitch_stabilization(data, target, 0.45 * (1.0 - phase))
+        self._apply_joint_targets(
+            data,
+            self._policy.clamp_target_positions(target),
+            0.78,
+            1.65,
+        )
         return True
 
-    def _target_for_time(self, elapsed: float) -> tuple[np.ndarray, float]:
-        if elapsed < 0.12:
-            phase = smootherstep(elapsed / 0.12)
-            target = (1.0 - phase) * self._start_targets + phase * self._compress
-            return target, self._jump_blend * 0.70 * phase
-
-        if elapsed < 0.24:
-            phase = smootherstep((elapsed - 0.12) / 0.12)
-            target = (1.0 - phase) * self._compress + phase * self._extend
-            blend = self._jump_blend * (0.70 + 0.30 * phase)
-            return target, blend
-
-        if elapsed < 0.48:
-            phase = smootherstep((elapsed - 0.24) / 0.24)
-            target = (1.0 - phase) * self._extend + phase * self._air
-            return target, self._jump_blend
-
-        phase = smootherstep((elapsed - 0.48) / max(self._jump_duration - 0.48, 1e-6))
-        target = (1.0 - phase) * self._air + phase * self._landing
-        blend = self._jump_blend * (1.0 - 0.60 * phase)
-        return target, blend
-
-    def _apply_joint_targets(self, data: mujoco.MjData, target: np.ndarray) -> None:
+    def _apply_joint_targets(
+        self,
+        data: mujoco.MjData,
+        target: np.ndarray,
+        stiffness_scale: float,
+        damping_scale: float,
+    ) -> None:
         for i, binding in enumerate(self._bindings):
             q = data.qpos[binding.qpos_adr]
             dq = data.qvel[binding.dof_adr]
-            tau = self._stiffness[i] * (target[i] - q) - self._damping[i] * dq
+            tau = stiffness_scale * self._stiffness[i] * (target[i] - q)
+            tau -= damping_scale * self._damping[i] * dq
             data.ctrl[binding.actuator_id] = np.clip(
                 tau,
                 binding.ctrl_min,
@@ -627,11 +1068,29 @@ class FlatWasdDashViewer(MouseKeyboardViewer):
         yaw_speed: float,
     ) -> CommandState:
         if self._window is None:
-            return CommandState(np.zeros(3, dtype=np.float32), False, False, False)
+            return CommandState(
+                np.zeros(3, dtype=np.float32),
+                False,
+                False,
+                False,
+                False,
+            )
 
         glfw = self._glfw
         if self.is_key_down(glfw.KEY_ESCAPE):
             glfw.set_window_should_close(self._window, True)
+
+        reset_held = self.is_key_down(glfw.KEY_R)
+        reset_requested = reset_held and not self._reset_was_down
+        self._reset_was_down = reset_held
+
+        lower_held = self.is_key_down(glfw.KEY_Z)
+        raise_held = self.is_key_down(glfw.KEY_X)
+        lower_requested = lower_held and not self._lower_was_down
+        raise_requested = raise_held and not self._raise_was_down
+        self._lower_was_down = lower_held
+        self._raise_was_down = raise_held
+        stance_adjust = int(lower_requested) - int(raise_requested)
 
         vx_key = float(self.is_key_down(glfw.KEY_W)) - float(
             self.is_key_down(glfw.KEY_S)
@@ -646,6 +1105,8 @@ class FlatWasdDashViewer(MouseKeyboardViewer):
             glfw.KEY_RIGHT_SHIFT
         )
         jump_held = self.is_key_down(glfw.KEY_SPACE)
+        jump_requested = jump_held and not self._space_was_down
+        self._space_was_down = jump_held
 
         planar = np.array([vx_key, vy_key], dtype=np.float64)
         norm = float(np.linalg.norm(planar))
@@ -674,9 +1135,12 @@ class FlatWasdDashViewer(MouseKeyboardViewer):
         active_motion = norm > 1e-6 or abs(yaw_key) > 0.0
         return CommandState(
             command,
+            jump_requested,
             jump_held,
             dash_held and norm > 1e-6,
             active_motion,
+            reset_requested,
+            stance_adjust,
         )
 
     def render_status(
@@ -685,6 +1149,9 @@ class FlatWasdDashViewer(MouseKeyboardViewer):
         command: np.ndarray,
         dash_held: bool,
         jump_active: bool,
+        stance_crouch: float = 0.0,
+        reset_count: int = 0,
+        status_note: str = "",
     ) -> None:
         if self._window is None:
             return
@@ -714,13 +1181,17 @@ class FlatWasdDashViewer(MouseKeyboardViewer):
             viewport,
             (
                 "W/A/S/D: move   Q/E: turn   Shift+WASD: dash   Space: jump\n"
+                "R: reset   Z/X: lower/raise stance\n"
                 "Left drag: rotate camera   Wheel: zoom   Esc: quit"
             ),
             (
                 f"vx={command[0]:+.2f}  vy={command[1]:+.2f}  "
                 f"yaw={command[2]:+.2f}  "
                 f"dash={'on' if dash_held else 'off'}  "
-                f"jump={'on' if jump_active else 'off'}"
+                f"jump={'on' if jump_active else 'off'}\n"
+                f"stance_crouch={stance_crouch:.3f}  "
+                f"resets={reset_count}  "
+                f"{status_note}"
             ),
             self._context,
         )
@@ -761,6 +1232,37 @@ def update_command_with_release_cutoff(
     return update_smoothed_command(current, target, dt, rate)
 
 
+def should_apply_idle_stabilization(
+    command: np.ndarray,
+    active_motion: bool,
+    jump: JointSpaceJumpController,
+) -> bool:
+    return (
+        not active_motion
+        and not jump.active
+        and float(np.linalg.norm(command)) < 1e-4
+    )
+
+
+def apply_idle_base_damping(
+    data: mujoco.MjData,
+    jump: JointSpaceJumpController,
+    damping: float,
+    speed_deadband: float,
+    timestep: float,
+) -> None:
+    if damping <= 0.0 or jump.foot_contact_count(data) < 3:
+        return
+
+    planar_speed = float(np.linalg.norm(data.qvel[0:2]))
+    yaw_speed = abs(float(data.qvel[5]))
+    factor = math.exp(-damping * timestep)
+    if planar_speed <= speed_deadband:
+        data.qvel[0:2] *= factor
+    if yaw_speed <= 2.0 * speed_deadband:
+        data.qvel[5] *= factor
+
+
 def smootherstep(x: float) -> float:
     x = min(max(x, 0.0), 1.0)
     return x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
@@ -768,6 +1270,39 @@ def smootherstep(x: float) -> float:
 
 def final_uprightness(data: mujoco.MjData) -> float:
     return float(root_rotation_matrix(data)[2, 2])
+
+
+def clamp_value(value: float, lower: float, upper: float) -> float:
+    return min(max(value, lower), upper)
+
+
+def reset_robot_pose(
+    policy: SimToRealPolicyController,
+    jump: JointSpaceJumpController,
+    data: mujoco.MjData,
+    base_height: float,
+    stance_crouch: float,
+) -> None:
+    sim_time = float(data.time)
+    policy.initialize_pose(
+        data,
+        base_height=base_height,
+        stance_crouch=stance_crouch,
+    )
+    data.time = sim_time
+    jump.cancel()
+
+
+def fall_reason(
+    data: mujoco.MjData,
+    fall_height: float,
+    fall_uprightness: float,
+) -> str:
+    if float(data.qpos[2]) < fall_height:
+        return "fall_height"
+    if final_uprightness(data) < fall_uprightness:
+        return "fall_uprightness"
+    return ""
 
 
 def validate_args(args: argparse.Namespace) -> None:
@@ -783,6 +1318,26 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Yaw speed must be non-negative.")
     if args.command_smoothing < 0.0:
         raise ValueError("Command smoothing must be non-negative.")
+    if args.reset_base_height <= 0.0:
+        raise ValueError("Reset base height must be positive.")
+    if args.min_stance_crouch < 0.0:
+        raise ValueError("Minimum stance crouch must be non-negative.")
+    if args.max_stance_crouch < args.min_stance_crouch:
+        raise ValueError("Maximum stance crouch must be >= minimum stance crouch.")
+    if args.stance_adjust_step < 0.0:
+        raise ValueError("Stance adjust step must be non-negative.")
+    if args.fall_height <= 0.0:
+        raise ValueError("Fall height must be positive.")
+    if not -1.0 <= args.fall_uprightness <= 1.0:
+        raise ValueError("Fall uprightness must be in [-1, 1].")
+    if args.fall_warmup < 0.0:
+        raise ValueError("Fall warmup must be non-negative.")
+    if args.idle_damping_scale < 1.0:
+        raise ValueError("Idle damping scale must be >= 1.")
+    if args.idle_base_damping < 0.0:
+        raise ValueError("Idle base damping must be non-negative.")
+    if args.idle_speed_deadband < 0.0:
+        raise ValueError("Idle speed deadband must be non-negative.")
     if args.render_fps <= 0.0:
         raise ValueError("Render FPS must be positive.")
     if args.test_jump_hold < 0.0:
@@ -798,14 +1353,23 @@ def main() -> None:
     model = mujoco.MjModel.from_xml_path(str(args.scene))
     data = mujoco.MjData(model)
     policy = SimToRealPolicyController(model, args.policy_dir)
-    policy.initialize_pose(data)
     jump = JointSpaceJumpController(policy, args.jump_duration, args.jump_blend)
+    stance_crouch = clamp_value(
+        args.stance_crouch,
+        args.min_stance_crouch,
+        args.max_stance_crouch,
+    )
+    policy.initialize_pose(
+        data,
+        base_height=args.reset_base_height,
+        stance_crouch=stance_crouch,
+    )
 
     print(f"Scene: {args.scene}")
     print(f"Policy: {args.policy_dir}")
     print(
         "Controls: W/A/S/D move, Q/E turn, Shift+WASD dashes, "
-        "Space jumps while held."
+        "Space taps jump."
     )
     print(
         "Command limits: "
@@ -814,17 +1378,34 @@ def main() -> None:
         f"lateral={args.dash_lateral_speed:.2f} m/s, "
         f"yaw={args.yaw_speed:.2f} rad/s"
     )
+    print(
+        "Posture: "
+        f"reset_base_height={args.reset_base_height:.3f}m, "
+        f"stance_crouch={stance_crouch:.3f}rad "
+        f"(Z/X adjust by {args.stance_adjust_step:.3f})"
+    )
+    print(
+        "Reset: "
+        f"R manual reset, "
+        f"auto_reset={'off' if args.no_auto_reset_on_fall else 'on'}, "
+        f"fall_height<{args.fall_height:.2f}m, "
+        f"uprightness<{args.fall_uprightness:.2f}"
+    )
 
     viewer = None
     if not args.headless:
         viewer = FlatWasdDashViewer(model)
 
     command = np.zeros(3, dtype=np.float32)
-    policy_target_reference = policy._target_joint_pos.copy()
+    policy_target_reference = policy.target_joint_positions()
     next_policy_time = data.time
     next_step_wall = time.perf_counter()
     render_interval = 1.0 / args.render_fps
     next_render_wall = next_step_wall
+    headless_jump_requested = False
+    reset_count = 0
+    status_note = ""
+    fall_warmup_until = data.time + args.fall_warmup
 
     try:
         while True:
@@ -849,12 +1430,13 @@ def main() -> None:
                     dtype=np.float32,
                 )
                 active_motion = bool(np.linalg.norm(target_command) > 1e-6)
-                jump_held = (
+                jump_requested = (
                     args.test_jump_time >= 0.0
-                    and args.test_jump_time
-                    <= data.time
-                    < args.test_jump_time + args.test_jump_hold
+                    and not headless_jump_requested
+                    and data.time >= args.test_jump_time
                 )
+                if jump_requested:
+                    headless_jump_requested = True
                 dash_held = False
             else:
                 state = viewer.read_command_state(
@@ -866,8 +1448,34 @@ def main() -> None:
                 )
                 target_command = state.command
                 active_motion = state.active_motion
-                jump_held = state.jump_held
+                jump_requested = state.jump_requested
                 dash_held = state.dash_held
+                if state.stance_adjust:
+                    stance_crouch = clamp_value(
+                        stance_crouch
+                        + state.stance_adjust * args.stance_adjust_step,
+                        args.min_stance_crouch,
+                        args.max_stance_crouch,
+                    )
+                    policy.set_stance_crouch(stance_crouch)
+                    status_note = f"stance adjusted to {stance_crouch:.3f}"
+
+                if state.reset_requested:
+                    reset_robot_pose(
+                        policy,
+                        jump,
+                        data,
+                        args.reset_base_height,
+                        stance_crouch,
+                    )
+                    command[:] = 0.0
+                    policy_target_reference = policy.target_joint_positions()
+                    next_policy_time = data.time
+                    next_step_wall = time.perf_counter()
+                    fall_warmup_until = data.time + args.fall_warmup
+                    reset_count += 1
+                    status_note = "manual reset"
+                    continue
 
             command = update_command_with_release_cutoff(
                 command,
@@ -879,19 +1487,75 @@ def main() -> None:
 
             if data.time >= next_policy_time:
                 policy.update_policy(data, command)
-                policy_target_reference = policy._target_joint_pos.copy()
+                policy_target_reference = policy.target_joint_positions()
                 next_policy_time += policy.step_dt
 
-            if not jump.apply_if_held(data, jump_held, policy_target_reference):
-                policy.apply_pd(data)
+            if not jump.apply_if_requested(
+                data,
+                jump_requested,
+                policy_target_reference,
+            ):
+                idle_stabilizing = should_apply_idle_stabilization(
+                    command,
+                    active_motion,
+                    jump,
+                )
+                policy.apply_pd(
+                    data,
+                    damping_scale=(
+                        args.idle_damping_scale if idle_stabilizing else 1.0
+                    ),
+                )
+                if idle_stabilizing:
+                    apply_idle_base_damping(
+                        data,
+                        jump,
+                        args.idle_base_damping,
+                        args.idle_speed_deadband,
+                        model.opt.timestep,
+                    )
 
             mujoco.mj_step(model, data)
+
+            if (
+                not args.no_auto_reset_on_fall
+                and data.time >= fall_warmup_until
+                and (reason := fall_reason(
+                    data,
+                    args.fall_height,
+                    args.fall_uprightness,
+                ))
+            ):
+                reset_robot_pose(
+                    policy,
+                    jump,
+                    data,
+                    args.reset_base_height,
+                    stance_crouch,
+                )
+                command[:] = 0.0
+                policy_target_reference = policy.target_joint_positions()
+                next_policy_time = data.time
+                next_step_wall = time.perf_counter()
+                fall_warmup_until = data.time + args.fall_warmup
+                reset_count += 1
+                status_note = f"auto reset: {reason}"
+                continue
+
             next_step_wall += model.opt.timestep
             if next_step_wall < now - 0.1:
                 next_step_wall = now
 
             if viewer is not None and now >= next_render_wall:
-                viewer.render_status(data, command, dash_held, jump.active)
+                viewer.render_status(
+                    data,
+                    command,
+                    dash_held,
+                    jump.active,
+                    stance_crouch,
+                    reset_count,
+                    status_note,
+                )
                 next_render_wall += render_interval
                 if next_render_wall < now - render_interval:
                     next_render_wall = now
