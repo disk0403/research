@@ -14,8 +14,10 @@ papers/pdfs/                      ローカル PDF 置き場。現在は .gitkee
 projects/go2-mujoco/README.md     MuJoCo プロジェクトの説明
 projects/go2-mujoco/requirements.txt
 projects/go2-mujoco/scripts/go2_teleop.py
+projects/go2-mujoco/scripts/go2_obstacle_avoidance_teleop.py
 projects/go2-mujoco/scripts/go2_vision_target_follow.py
 projects/go2-mujoco/scripts/go2_continuous_rough_terrain_teleop.py
+projects/go2-mujoco/scripts/evaluate_locomotion_viewer.py
 projects/go2-mujoco/external/     ローカル実行資産。読み取り専用として扱う
 projects/go2-mujoco/.venv/        ローカル Python 環境
 ```

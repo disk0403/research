@@ -10,23 +10,20 @@ Unitree Go2 を MuJoCo 上で動かすための実験用プロジェクトです
 
 `scripts/evaluate_locomotion_viewer.py` では、連続的な凹凸路面上で既存ポリシーに一定の速度指令を自動入力し、複数エピソードを GUI で観察しながら JSONL ログへ結果を保存できます。
 
+`scripts/go2_obstacle_avoidance_teleop.py` では、平面上に直方体障害物を配置し、`go2_teleop.py` と同じキー操作に raycast ベースの簡単な障害物回避を重ねて試せます。
+
 ## クイックスタート
 
-Go2 MuJoCo プロジェクトへ移動します。
+SSH接続を行う。
+
+```bash
+ssh 100.85.29.86
+```
+
+Go2 MuJoCo プロジェクトへ移動し、仮想環境を有効化する。
 
 ```bash
 cd /home/daisuke/research/projects/go2-mujoco
-```
-
-依存パッケージを入れます。
-
-```bash
-python3 -m pip install -r requirements.txt
-```
-
-このディレクトリにある既存のローカル仮想環境を使う場合:
-
-```bash
 source .venv/bin/activate
 ```
 
@@ -46,6 +43,30 @@ GUI なしで短時間テストする場合:
 
 ```bash
 python3 scripts/go2_teleop.py --headless --duration 2 --test-command-vx 0.4
+```
+
+障害物回避付きで遠隔操作する場合:
+
+```bash
+python3 scripts/go2_obstacle_avoidance_teleop.py
+```
+
+GUI なしで短く確認する場合:
+
+```bash
+python3 scripts/go2_obstacle_avoidance_teleop.py \
+  --headless \
+  --duration 5 \
+  --test-command-vx 0.35
+```
+
+障害物検知距離や停止距離を変える場合:
+
+```bash
+python3 scripts/go2_obstacle_avoidance_teleop.py \
+  --sensor-range 1.8 \
+  --avoid-distance 1.2 \
+  --stop-distance 0.45
 ```
 
 カメラ画像から対象物を検出して追従するプロトタイプ:
@@ -134,6 +155,12 @@ Esc          終了
 
 キーを離すと速度指令は即座にゼロになります。キーを押している間の速度変化だけ `--command-smoothing` で平滑化されます。
 
+旋回について:
+
+- デフォルトの `--yaw-speed` は `0.5` rad/s。
+- `--yaw-safety-limit 1.0` で、ポリシー設定上の yaw コマンド範囲に合わせて上限をかけている。
+- 以前の実装では MuJoCo の free joint 角速度をさらに body frame へ回していたため、歩行中旋回で姿勢が崩れやすかった。現在はポリシー観測へ `qvel[3:6]` をそのまま渡す。
+
 姿勢調整:
 
 - デフォルトでは `--reset-base-height 0.25`、`--stance-crouch 0.08` を使い、以前より少し低い姿勢で開始します。
@@ -154,6 +181,7 @@ Esc          終了
 ```text
 requirements.txt
 scripts/go2_teleop.py
+scripts/go2_obstacle_avoidance_teleop.py
 scripts/go2_vision_target_follow.py
 scripts/go2_continuous_rough_terrain_teleop.py
 scripts/evaluate_locomotion_viewer.py
@@ -179,6 +207,27 @@ external/policies/unitree-go2-velocity-flat/
 
 ```text
 external/unitree_mujoco/unitree_robots/go2/scene_flat.xml
+```
+
+### `scripts/go2_obstacle_avoidance_teleop.py`
+
+平面上に直方体障害物を置き、`go2_teleop.py` と同じ操作に簡単な障害物回避を追加する実験スクリプトです。
+
+- 実行時に一時 XML を作り、Go2 と複数の直方体障害物を配置する
+- Go2 の前方に複数の水平 raycast を飛ばし、近い障害物までの距離を見る
+- 前進中に中央前方が塞がっている場合、前進速度を落とし、空いている側へ yaw 指令と少しの横移動指令を加える
+- `--sensor-range`、`--avoid-distance`、`--stop-distance`、`--ray-count`、`--ray-angle-span-deg` で検知と回避の挙動を調整できる
+- `--max-avoid-yaw-rate` と `--avoid-lateral-speed` で回避時の旋回量と横移動量を調整できる
+- `--obstacle X,Y,Z,HALF_X,HALF_Y,HALF_Z` を繰り返して任意の直方体障害物を追加できる
+- `--disable-avoidance` を使うと、障害物は残したまま通常 teleop と同じ入力で比較できる
+
+実行例:
+
+```bash
+python3 scripts/go2_obstacle_avoidance_teleop.py
+python3 scripts/go2_obstacle_avoidance_teleop.py --sensor-range 1.8 --avoid-distance 1.2 --stop-distance 0.45
+python3 scripts/go2_obstacle_avoidance_teleop.py --obstacle 2.5,0.2,0.25,0.2,0.4,0.25
+python3 scripts/go2_obstacle_avoidance_teleop.py --headless --duration 5 --test-command-vx 0.35
 ```
 
 ### `scripts/go2_vision_target_follow.py`
@@ -451,12 +500,13 @@ python3 scripts/go2_teleop.py --help
 
 ## 現在のディレクトリ構成
 
-`go2_teleop.py` の実行に必要なものだけを中心に整理しています。
+主な実行スクリプトと、ローカル実行に必要な資産を中心に整理しています。
 
 ```text
 README.md
 requirements.txt
 scripts/go2_teleop.py
+scripts/go2_obstacle_avoidance_teleop.py
 scripts/go2_vision_target_follow.py
 scripts/go2_continuous_rough_terrain_teleop.py
 scripts/evaluate_locomotion_viewer.py

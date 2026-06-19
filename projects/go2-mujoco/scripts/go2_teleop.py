@@ -17,6 +17,8 @@ FLAT_ONLY_SCENE = MODEL_DIR / "scene_flat.xml"
 POLICY_DIR = ROOT / "external" / "policies" / "unitree-go2-velocity-flat"
 DEFAULT_DISPLAY = ":1"
 DEFAULT_RENDER_FPS = 60.0
+DEFAULT_YAW_SPEED = 0.5
+DEFAULT_YAW_SAFETY_LIMIT = 1.0
 DEFAULT_RESET_BASE_HEIGHT = 0.25
 DEFAULT_STANCE_CROUCH = 0.08
 DEFAULT_MIN_STANCE_CROUCH = 0.0
@@ -235,7 +237,9 @@ class Go2PolicyController:
         command: np.ndarray,
     ) -> np.ndarray:
         rotation = root_rotation_matrix(data)
-        base_ang_vel = rotation.T @ data.qvel[3:6]
+        # The exported policy expects MuJoCo's free-joint angular velocity
+        # directly. Rotating it again makes combined walking/turning unstable.
+        base_ang_vel = data.qvel[3:6]
         projected_gravity = rotation.T @ WORLD_GRAVITY
         joint_pos_rel = self._joint_positions(data) - self._default_joint_pos
         joint_vel_rel = self._joint_velocities(data)
@@ -438,8 +442,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--yaw-speed",
         type=float,
-        default=0.5,
+        default=DEFAULT_YAW_SPEED,
         help="Q/E yaw rate command in rad/s.",
+    )
+    parser.add_argument(
+        "--yaw-safety-limit",
+        type=float,
+        default=DEFAULT_YAW_SAFETY_LIMIT,
+        help=(
+            "Clamp commanded yaw rate before policy inference. Use 0 to disable "
+            "this guard. The default matches the policy command range."
+        ),
     )
     parser.add_argument(
         "--command-smoothing",
@@ -1232,6 +1245,15 @@ def update_command_with_release_cutoff(
     return update_smoothed_command(current, target, dt, rate)
 
 
+def limit_yaw_command(command: np.ndarray, yaw_safety_limit: float) -> np.ndarray:
+    limited = command.astype(np.float32, copy=True)
+    if yaw_safety_limit > 0.0:
+        limited[2] = np.float32(
+            clamp_value(float(limited[2]), -yaw_safety_limit, yaw_safety_limit)
+        )
+    return limited
+
+
 def should_apply_idle_stabilization(
     command: np.ndarray,
     active_motion: bool,
@@ -1316,6 +1338,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Dash lateral speed must be non-negative.")
     if args.yaw_speed < 0.0:
         raise ValueError("Yaw speed must be non-negative.")
+    if getattr(args, "yaw_safety_limit", 0.0) < 0.0:
+        raise ValueError("Yaw safety limit must be non-negative.")
     if args.command_smoothing < 0.0:
         raise ValueError("Command smoothing must be non-negative.")
     if args.reset_base_height <= 0.0:
@@ -1376,7 +1400,8 @@ def main() -> None:
         f"forward={args.dash_forward_speed:.2f} m/s, "
         f"backward={args.dash_backward_speed:.2f} m/s, "
         f"lateral={args.dash_lateral_speed:.2f} m/s, "
-        f"yaw={args.yaw_speed:.2f} rad/s"
+        f"yaw={args.yaw_speed:.2f} rad/s, "
+        f"yaw_safety={args.yaw_safety_limit:.2f} rad/s"
     )
     print(
         "Posture: "
@@ -1477,6 +1502,7 @@ def main() -> None:
                     status_note = "manual reset"
                     continue
 
+            target_command = limit_yaw_command(target_command, args.yaw_safety_limit)
             command = update_command_with_release_cutoff(
                 command,
                 target_command,

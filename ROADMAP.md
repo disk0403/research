@@ -22,12 +22,13 @@ Go2 が低速で 2D ウェイポイントを追従し、転倒・接触・危険
 - `--headless --duration` で短時間のスモークテストを実行できる。
 - `projects/go2-mujoco/scripts/go2_vision_target_follow.py` で、MuJoCo の仮想前方カメラ画像から単純な色付き対象物を検出し、低速で追従するプロトタイプを試せる。
 - `projects/go2-mujoco/scripts/go2_continuous_rough_terrain_teleop.py` で、隙間や段差のない連続的な凹凸路面上の手動操作を試せる。
+- `projects/go2-mujoco/scripts/go2_obstacle_avoidance_teleop.py` で、平面上の直方体障害物に対する raycast ベースの手動回避プロトタイプを試せる。
 
 まだできていないこと:
 
 - 誘導タスクの自動評価。
 - ウェイポイント追従。
-- 障害物や廊下を含む評価シナリオ。
+- 障害物や廊下を含む自動評価シナリオ。
 - 接触、転倒、ゴール到達、停止理由のログ化。
 - 実センサ入力、ユーザー想定位置、人との距離、安全停止、音声/触覚インターフェース。
 

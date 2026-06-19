@@ -25,6 +25,8 @@ from go2_teleop import (
     DEFAULT_RESET_BASE_HEIGHT,
     DEFAULT_STANCE_ADJUST_STEP,
     DEFAULT_STANCE_CROUCH,
+    DEFAULT_YAW_SAFETY_LIMIT,
+    DEFAULT_YAW_SPEED,
     MODEL_DIR,
     POLICY_DIR,
     FlatWasdDashViewer,
@@ -34,6 +36,7 @@ from go2_teleop import (
     clamp_value,
     fall_reason,
     final_uprightness,
+    limit_yaw_command,
     reset_robot_pose,
     should_apply_idle_stabilization,
     update_command_with_release_cutoff,
@@ -187,8 +190,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--yaw-speed",
         type=float,
-        default=0.5,
+        default=DEFAULT_YAW_SPEED,
         help="Q/E yaw rate command in rad/s.",
+    )
+    parser.add_argument(
+        "--yaw-safety-limit",
+        type=float,
+        default=DEFAULT_YAW_SAFETY_LIMIT,
+        help=(
+            "Clamp commanded yaw rate before policy inference. Use 0 to disable."
+        ),
     )
     parser.add_argument(
         "--command-smoothing",
@@ -342,6 +353,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("Dash lateral speed must be non-negative.")
     if args.yaw_speed < 0.0:
         raise ValueError("Yaw speed must be non-negative.")
+    if args.yaw_safety_limit < 0.0:
+        raise ValueError("Yaw safety limit must be non-negative.")
     if args.command_smoothing < 0.0:
         raise ValueError("Command smoothing must be non-negative.")
     if args.reset_base_height <= 0.0:
@@ -611,7 +624,8 @@ def main() -> None:
             f"forward={args.dash_forward_speed:.2f} m/s, "
             f"backward={args.dash_backward_speed:.2f} m/s, "
             f"lateral={args.dash_lateral_speed:.2f} m/s, "
-            f"yaw={args.yaw_speed:.2f} rad/s"
+            f"yaw={args.yaw_speed:.2f} rad/s, "
+            f"yaw_safety={args.yaw_safety_limit:.2f} rad/s"
         )
         print(
             "Posture: "
@@ -709,6 +723,7 @@ def main() -> None:
                     status_note = "manual reset"
                     continue
 
+            target_command = limit_yaw_command(target_command, args.yaw_safety_limit)
             command = update_command_with_release_cutoff(
                 command,
                 target_command,
