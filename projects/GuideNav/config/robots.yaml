@@ -1,0 +1,54 @@
+mc:
+  # Velocity limits
+  max_v: 1.5 # m/s
+  min_v: 0.0 # m/s
+  max_w: 0.6 # rad/s
+  max_a: 0.75 # m/s^2
+  max_alpha: 1.2 # rad/s^2
+
+  # Sensor settings
+  frame_rate: 5 # Hz
+  camera_height: 0.35 # m
+
+  # Camera intrinsics
+  fx: 454.102
+  fy: 453.927
+  cx: 325.456
+  cy: 181.126
+
+  # Robot dimensions
+  size_width: 0.4 # m
+  size_length: 0.7 # m
+
+  # Control parameters
+  control_dt: 0.1 # s
+  delta_v: 0.15
+  delta_w: 0.1 # rad/s
+
+  # Smooth behavior params
+  smooth_pose_alpha_x: 0.8
+  smooth_pose_alpha_y: 0.1
+  smooth_pose_alpha_yaw: 0.5
+  smooth_cmd_alpha: 0.6
+
+
+
+
+go2:
+  # linear and angular speed limits for the robot
+  max_v: 0.15 # 0.2 # m/s
+  max_w: 1.0 # 0.6 # rad/s
+
+  # observation rate of the robot
+  frame_rate: 4 # 5 # Hz
+  camera_height: 0.35 # m
+
+  # topic names
+  vel_teleop_topic: "/mobile_base/commands/velocity" 
+  vel_navi_topic: "/mobile_base/commands/velocity"
+  odom_topic: "/odom"
+  camera_topic: "/usb_cam/image_raw"
+  waypoint_topic: "/waypoint"
+  reached_goal_topic: "/toponav/reached_goal"
+  stop_topic: "/toponav/stop"
+  toponav_viz_info_topic: "/toponav/viz_info"
