@@ -43,8 +43,21 @@ def parse_args() -> argparse.Namespace:
     build = subparsers.add_parser("build", help="build topomap and CosPlace VPR DB from the latest teach run")
     build.add_argument("--run", type=Path, default=None, help="raw teach run directory; default is latest")
     build.add_argument("--topomap-dir", type=Path, default=DEFAULT_TOPOMAP_DIR)
-    build.add_argument("--distance", type=float, default=0.35)
-    build.add_argument("--yaw", type=float, default=14.0)
+    build.add_argument(
+        "--topomap-builder",
+        choices=("vision", "odom"),
+        default="vision",
+        help="vision uses DINO-style visual embeddings; odom uses the older distance/yaw thresholds",
+    )
+    build.add_argument("--distance", type=float, default=0.35, help="odom builder distance threshold in meters")
+    build.add_argument("--yaw", type=float, default=14.0, help="odom builder yaw threshold in degrees")
+    build.add_argument("--device", choices=("auto", "cpu", "cuda"), default="auto")
+    build.add_argument("--feature-model", choices=("auto", "dinov3", "dinov2"), default="auto")
+    build.add_argument("--dinov3-repo", default=os.environ.get("DINOV3_REPO"))
+    build.add_argument("--dinov3-model", default="dinov3_vitl16")
+    build.add_argument("--dinov3-weights", type=Path, default=None)
+    build.add_argument("--min-frame-gap", type=int, default=5)
+    build.add_argument("--force-frame-gap", type=int, default=50)
     build.add_argument("--pr-model", default="cosplace_hub")
     build.add_argument("--skip-vpr", action="store_true")
     build.add_argument(
@@ -193,18 +206,41 @@ def cmd_build(args: argparse.Namespace) -> None:
     if not args.keep_existing:
         archive_existing_topomap(args.topomap_dir)
 
-    run_command(
-        [
+    if args.topomap_builder == "vision":
+        command = [
             sys.executable,
-            "sensor/build_topomap.py",
+            "mujoco_sim/build_topomap_vision.py",
             str(run_dir),
             str(args.topomap_dir),
-            "--distance",
-            str(args.distance),
-            "--yaw",
-            str(args.yaw),
+            "--device",
+            args.device,
+            "--feature-model",
+            args.feature_model,
+            "--dinov3-model",
+            args.dinov3_model,
+            "--min-frame-gap",
+            str(args.min_frame_gap),
+            "--force-frame-gap",
+            str(args.force_frame_gap),
         ]
-    )
+        if args.dinov3_repo:
+            command += ["--dinov3-repo", args.dinov3_repo]
+        if args.dinov3_weights is not None:
+            command += ["--dinov3-weights", str(args.dinov3_weights)]
+        run_command(command)
+    else:
+        run_command(
+            [
+                sys.executable,
+                "sensor/build_topomap.py",
+                str(run_dir),
+                str(args.topomap_dir),
+                "--distance",
+                str(args.distance),
+                "--yaw",
+                str(args.yaw),
+            ]
+        )
 
     if not args.skip_vpr:
         run_command(

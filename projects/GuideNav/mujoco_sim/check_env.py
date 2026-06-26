@@ -21,6 +21,7 @@ def main() -> None:
         ("OpenCV cv2", has_module("cv2")),
         ("pandas", has_module("pandas")),
         ("h5py", has_module("h5py")),
+        ("Pillow PIL", has_module("PIL")),
         ("PyTorch", has_module("torch")),
         ("torchvision", has_module("torchvision")),
         ("kornia", has_module("kornia")),
@@ -59,6 +60,7 @@ def main() -> None:
 
     print("\nNotes:")
     print("  - Recording teaching data needs the MuJoCo/Go2 items.")
+    print("  - build_topomap_vision.py needs Pillow, PyTorch/torchvision, and a DINO-style feature model.")
     print("  - replay_cosplace.py needs OpenCV, h5py, PyTorch/torchvision, CosPlace, Reloc3r, and the VPR DB.")
     print("  - Running official guidenav/navigate.py also needs ROS2, cv_bridge, and feature-matching model weights.")
 
